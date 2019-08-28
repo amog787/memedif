@@ -9,15 +9,23 @@ import android.os.SystemClock;
 import android.os.Trace;
 import android.provider.MiuiSettings.System;
 import android.util.Log;
+import android.util.Slog;
 import com.android.keyguard.KeyguardUpdateMonitor;
 import com.android.keyguard.KeyguardUpdateMonitorCallback;
 import com.android.keyguard.LatencyTracker;
+import com.android.keyguard.MiuiKeyguardFingerprintUtils;
+import com.android.keyguard.MiuiKeyguardFingerprintUtils.FingerprintIdentificationState;
+import com.android.keyguard.MiuiKeyguardUtils;
+import com.android.keyguard.analytics.AnalyticsHelper;
+import com.android.keyguard.fod.MiuiGxzwManager;
 import com.android.systemui.Dependency;
 import com.android.systemui.keyguard.KeyguardViewMediator;
 
 public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
+    private boolean mCancelingPendingLock = false;
     private final Context mContext;
     private DozeScrimController mDozeScrimController;
+    private FingerprintIdentificationState mFpiState;
     private Handler mHandler = new Handler();
     private KeyguardViewMediator mKeyguardViewMediator;
     private int mMode;
@@ -73,6 +81,11 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
         System.putBooleanForUser(this.mContext.getContentResolver(), "is_fingerprint_unlock", true, -2);
     }
 
+    private void recordUnlockWay() {
+        AnalyticsHelper.recordUnlockWay("fp");
+        this.mKeyguardViewMediator.recordFingerprintUnlockState();
+    }
+
     private void releaseFingerprintWakeLock() {
         if (this.mWakeLock != null) {
             this.mHandler.removeCallbacks(this.mReleaseFingerprintWakeLockRunnable);
@@ -83,8 +96,7 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
     }
 
     public void finishKeyguardFadingAway() {
-        this.mMode = 0;
-        this.mUpdateMonitor.setFingerprintMode(this.mMode);
+        resetMode();
         this.mStatusBarWindowManager.setForceDozeBrightness(false);
         if (this.mStatusBar.getNavigationBarView() != null) {
             this.mStatusBar.getNavigationBarView().setWakeAndUnlocking(false);
@@ -94,6 +106,10 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
 
     public int getMode() {
         return this.mMode;
+    }
+
+    public synchronized boolean isCancelingPendingLock() {
+        return this.mCancelingPendingLock;
     }
 
     public void onFingerprintAcquired() {
@@ -118,26 +134,54 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
 
     public void onFingerprintAuthFailed() {
         cleanup();
+        this.mFpiState = FingerprintIdentificationState.FAILED;
+        MiuiKeyguardFingerprintUtils.processFingerprintResultAnalytics(0);
     }
 
     public void onFingerprintAuthenticated(int i) {
         Trace.beginSection("FingerprintUnlockController#onFingerprintAuthenticated");
         if (this.mUpdateMonitor.isGoingToSleep()) {
-            this.mPendingAuthenticatedUserId = i;
+            int i2 = 0;
+            boolean isUnlockingWithFingerprintAllowed = this.mUpdateMonitor.isUnlockingWithFingerprintAllowed(i);
+            if (this.mDozeScrimController.isPulsing() && isUnlockingWithFingerprintAllowed) {
+                i2 = 2;
+            } else if (isUnlockingWithFingerprintAllowed || !this.mUnlockMethodCache.isMethodSecure()) {
+                i2 = 1;
+            }
+            this.mUpdateMonitor.setFingerprintMode(i2);
+            if (!this.mKeyguardViewMediator.isShowing() && KeyguardUpdateMonitor.getCurrentUser() == i && ((i2 == 2 || i2 == 1) && MiuiKeyguardUtils.isAodClockDisable(this.mContext))) {
+                Slog.i("miui_keyguard_fingerprint", "Unlock by fingerprint, keyguard is not showing and wake up");
+                recordUnlockWay();
+                this.mKeyguardViewMediator.cancelPendingLock();
+                synchronized (this) {
+                    this.mCancelingPendingLock = true;
+                }
+                this.mPowerManager.wakeUp(SystemClock.uptimeMillis(), "android.policy:FINGERPRINT");
+            } else {
+                this.mPendingAuthenticatedUserId = i;
+                this.mKeyguardViewMediator.recordFingerprintUnlockState();
+            }
             Trace.endSection();
             return;
         }
         boolean isDeviceInteractive = this.mUpdateMonitor.isDeviceInteractive();
         this.mMode = calculateMode(i);
-        this.mUpdateMonitor.setFingerprintMode(this.mMode);
         if (!(KeyguardUpdateMonitor.getCurrentUser() == i || this.mMode == 3 || this.mMode == 0 || this.mMode == 4)) {
-            try {
-                ActivityManagerNative.getDefault().switchUser(i);
-            } catch (Throwable e) {
-                Log.e("FingerprintController", "switchUser failed", e);
+            if (MiuiKeyguardUtils.canSwitchUser(this.mContext, i)) {
+                if (MiuiKeyguardUtils.isGxzwSensor()) {
+                    MiuiGxzwManager.getInstance().onKeyguardHide();
+                }
+                try {
+                    ActivityManagerNative.getDefault().switchUser(i);
+                } catch (Throwable e) {
+                    Log.e("FingerprintController", "switchUser failed", e);
+                }
+            } else {
+                this.mMode = 3;
             }
         }
-        PanelBar.LOG(getClass(), "calculateMode userid=0;mode=" + this.mMode);
+        this.mUpdateMonitor.setFingerprintMode(this.mMode);
+        PanelBar.LOG(getClass(), "calculateMode userid=" + i + ";mode=" + this.mMode);
         if (!isDeviceInteractive) {
             Log.i("FingerprintController", "fp wakelock: Authenticated, waking up...");
             this.mPowerManager.wakeUp(SystemClock.uptimeMillis(), "android.policy:FINGERPRINT");
@@ -163,6 +207,7 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
                 if (this.mStatusBar.getNavigationBarView() != null) {
                     this.mStatusBar.getNavigationBarView().setWakeAndUnlocking(true);
                 }
+                recordUnlockWay();
                 Trace.endSection();
                 break;
             case 3:
@@ -181,11 +226,13 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
                 }
                 this.mStatusBarWindowManager.setStatusBarFocusable(false);
                 this.mKeyguardViewMediator.keyguardDone();
+                recordUnlockWay();
                 Trace.endSection();
                 break;
             case 6:
                 Trace.beginSection("MODE_DISMISS");
                 this.mStatusBarKeyguardViewManager.notifyKeyguardAuthenticated(false);
+                recordUnlockWay();
                 Trace.endSection();
                 break;
         }
@@ -193,11 +240,17 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
             this.mStatusBarWindowManager.setForceDozeBrightness(false);
         }
         this.mStatusBar.notifyFpAuthModeChanged();
+        this.mFpiState = FingerprintIdentificationState.SUCCEEDED;
+        MiuiKeyguardFingerprintUtils.processFingerprintResultAnalytics(1);
         Trace.endSection();
     }
 
     public void onFingerprintError(int i, String str) {
         cleanup();
+        if (FingerprintIdentificationState.ERROR != this.mFpiState && (i == 7 || i == 9)) {
+            this.mStatusBarKeyguardViewManager.animateCollapsePanels(0.0f);
+        }
+        this.mFpiState = FingerprintIdentificationState.ERROR;
     }
 
     public void onFinishedGoingToSleep(int i) {
@@ -209,8 +262,32 @@ public class FingerprintUnlockController extends KeyguardUpdateMonitorCallback {
         Trace.endSection();
     }
 
+    public void onScreenTurnedOn() {
+        if (this.mUpdateMonitor.isUnlockWithFingerprintPossible(KeyguardUpdateMonitor.getCurrentUser()) && (!this.mUpdateMonitor.isUnlockingWithFingerprintAllowed() || this.mUpdateMonitor.isFingerprintTemporarilyLockout())) {
+            this.mStatusBarKeyguardViewManager.animateCollapsePanels(0.0f);
+        }
+        synchronized (this) {
+            if (this.mCancelingPendingLock) {
+                this.mCancelingPendingLock = false;
+                resetMode();
+            }
+        }
+    }
+
     public void onStartedGoingToSleep(int i) {
         this.mPendingAuthenticatedUserId = -1;
+    }
+
+    public synchronized void resetCancelingPendingLock() {
+        if (this.mCancelingPendingLock) {
+            this.mCancelingPendingLock = false;
+            this.mHandler.post(new 4(this));
+        }
+    }
+
+    public void resetMode() {
+        this.mMode = 0;
+        this.mUpdateMonitor.setFingerprintMode(this.mMode);
     }
 
     public void setStatusBarKeyguardViewManager(StatusBarKeyguardViewManager statusBarKeyguardViewManager) {
